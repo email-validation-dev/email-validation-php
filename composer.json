@@ -1,0 +1,52 @@
+{
+    "name": "email-validation/sdk",
+    "description": "Official PHP client for the email-validation.org email validation API.",
+    "license": "MIT",
+    "type": "library",
+    "keywords": [
+        "email",
+        "email validation",
+        "email verification",
+        "api",
+        "sdk"
+    ],
+    "homepage": "https://email-validation.org/docs/sdks/php/",
+    "authors": [
+        {
+            "name": "email-validation.org",
+            "email": "support@email-validation.org"
+        }
+    ],
+    "support": {
+        "email": "support@email-validation.org",
+        "docs": "https://email-validation.org/docs/sdks/php/"
+    },
+    "require": {
+        "php": ">=8.1",
+        "ext-curl": "*",
+        "ext-json": "*"
+    },
+    "require-dev": {
+        "phpstan/phpstan": "^2.1",
+        "phpunit/phpunit": "^10.5 || ^11.5 || ^12.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "EmailValidation\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "EmailValidation\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit",
+        "analyse": "phpstan analyse --no-progress",
+        "lint": "find src tests -name '*.php' -print0 | xargs -0 -n1 php -l"
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable"
+}
