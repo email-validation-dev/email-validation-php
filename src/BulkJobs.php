@@ -25,9 +25,12 @@ final class BulkJobs
      * Creates a job from a list of addresses (sent as JSON, up to 100,000) or from a file (a CSV, or one address per
      * line, up to 100 MB). Pass exactly one of `emails` and `file`.
      *
-     * @param list<string>|null    $emails            the addresses
-     * @param string|resource|null $file              the file's contents, or a readable stream (read to its end
-     *                                                and buffered: the API needs a known length and retries resend it)
+     * @param list<string>|null                 $emails the addresses (a list: one address as a plain string is a
+     *                                                  \TypeError)
+     * @param string|resource|\SplFileInfo|null $file   the file's contents as a string (never a path), a readable
+     *                                                  stream (read to its end and buffered: the API needs a known
+     *                                                  length and retries resend it), or a path as
+     *                                                  `new \SplFileInfo('list.csv')`
      * @param string               $contentType       `text/csv` (default) or `text/plain`, for `file`
      * @param int|string|null      $column            the address column: 1–512, or a header name
      * @param bool|null            $hasHeader         whether the first row is a header
@@ -36,12 +39,13 @@ final class BulkJobs
      * @param string|null          $webhookEndpointId a webhook endpoint to notify when the job ends
      *
      * @throws \InvalidArgumentException when both or neither of `emails` and `file` are given, `emails` is not a
-     *                                   list of strings, `file` is not a string or stream, or `contentType` is not allowed
+     *                                   list of strings, `file` is not a string, stream or readable \SplFileInfo, or
+     *                                   `contentType` is not allowed
      * @throws EmailValidationException
      */
     public function create(
-        ?array $emails = null,
-        mixed $file = null,
+        #[\SensitiveParameter] ?array $emails = null,
+        #[\SensitiveParameter] mixed $file = null,
         string $contentType = 'text/csv',
         int|string|null $column = null,
         ?bool $hasHeader = null,
@@ -71,7 +75,7 @@ final class BulkJobs
             }
             $response = $this->engine->send('POST', '/v1/bulk', $query, json: ['emails' => $emails]);
         } else {
-            $response = $this->engine->send('POST', '/v1/bulk', $query, body: self::fileBody($file), contentType: $contentType);
+            $response = $this->engine->send('POST', '/v1/bulk', $query, body: self::fileBody($file), contentType: $contentType, transfer: true);
         }
 
         return $this->engine->decode($response, BulkJob::fromArray(...));
@@ -132,7 +136,7 @@ final class BulkJobs
         ?bool $escapeFormulas = null,
         ?string $range = null,
     ): string {
-        return $this->download($jobId, $filter, $columns, $escapeFormulas, $range)->body();
+        return $this->fetchResults($jobId, $filter, $columns, $escapeFormulas, $range)->body();
     }
 
     /**
@@ -152,7 +156,90 @@ final class BulkJobs
         ?bool $escapeFormulas = null,
         ?string $range = null,
     ) {
-        return $this->download($jobId, $filter, $columns, $escapeFormulas, $range)->stream();
+        return $this->fetchResults($jobId, $filter, $columns, $escapeFormulas, $range)->stream();
+    }
+
+    /**
+     * Downloads the result CSV straight into a file (never held in memory) and returns the file's size in bytes.
+     *
+     * With `resume` (the default) and a non-empty file at `path`, only the missing end is fetched (`Range:
+     * bytes=<size>-`) and appended; a file that is already complete is left as it is. Resuming needs a shape the API
+     * can serve in parts: filter `all` (or one status with `escapeFormulas: false`) and columns `original`. Without
+     * a file (or with `resume: false`) the file is created or truncated and the whole CSV written. A failure while
+     * downloading leaves the partial file in place, so the next call resumes; a download that already wrote bytes is
+     * not retried.
+     *
+     * @param string|\SplFileInfo      $path   the file to write
+     * @param string|list<string>|null $filter `all` (default), one status, or a list of statuses
+     *
+     * @throws \InvalidArgumentException when the arguments are not valid, or a resume is asked for a shape that
+     *                                   cannot be served in parts (nothing is sent)
+     * @throws \RuntimeException         when the file cannot be opened for writing
+     * @throws InvalidRequestException   when the API answers a resume with the whole file (the file is left untouched)
+     * @throws EmailValidationException
+     */
+    public function download(
+        string $jobId,
+        string|\SplFileInfo $path,
+        bool $resume = true,
+        string|array|null $filter = null,
+        ?string $columns = null,
+        ?bool $escapeFormulas = null,
+    ): int {
+        $resultsPath = '/v1/bulk/' . Engine::checkJobId($jobId) . '/results';
+        $query = ['filter' => self::filter($filter), 'columns' => $columns, 'escape_formulas' => $escapeFormulas];
+        $file = $path instanceof \SplFileInfo ? $path->getPathname() : $path;
+        if ($file === '') {
+            throw new \InvalidArgumentException('path must name a file.');
+        }
+        clearstatcache(true, $file);
+        $size = $resume && is_file($file) ? (int) filesize($file) : 0;
+        if ($size > 0) {
+            $one = is_string($filter) ? $filter !== 'all' : ($filter !== null && count($filter) === 1);
+            $whole = $filter === null || $filter === 'all';
+            if (!(($whole || ($one && $escapeFormulas === false)) && ($columns === null || $columns === 'original'))) {
+                throw new \InvalidArgumentException(
+                    'This download cannot be resumed: use filter "all" (or one status with escapeFormulas false) and columns "original", or pass resume: false.',
+                );
+            }
+        }
+        $out = @fopen($file, $size > 0 ? 'ab' : 'wb');
+        if ($out === false) {
+            throw new \RuntimeException('The download file could not be opened for writing.');
+        }
+        try {
+            if ($size === 0) {
+                $response = $this->engine->send('GET', $resultsPath, $query, accept: 'text/csv', transfer: true, sink: $out);
+
+                return self::append($response, $out);
+            }
+            $response = $this->engine->send(
+                'GET',
+                $resultsPath,
+                $query,
+                accept: 'text/csv',
+                headers: ['range' => 'bytes=' . $size . '-'],
+                transfer: true,
+                sink: $out,
+                pass: [416],
+            );
+            if ($response->status === 416) {
+                if (trim((string) $response->header('content-range')) === 'bytes */' . $size) {
+                    $response->close();
+
+                    return $size; // already complete
+                }
+                throw $this->engine->errorFrom($response);
+            }
+            if ($response->status !== 206) {
+                $response->close();
+                throw self::rangeRefused($response);
+            }
+
+            return self::append($response, $out);
+        } finally {
+            fclose($out);
+        }
     }
 
     /**
@@ -189,45 +276,96 @@ final class BulkJobs
     }
 
     /** @param string|list<string>|null $filter */
-    private function download(string $jobId, string|array|null $filter, ?string $columns, ?bool $escapeFormulas, ?string $range): Response
+    private function fetchResults(string $jobId, string|array|null $filter, ?string $columns, ?bool $escapeFormulas, ?string $range): Response
     {
         $path = '/v1/bulk/' . Engine::checkJobId($jobId) . '/results';
         $query = ['filter' => self::filter($filter), 'columns' => $columns, 'escape_formulas' => $escapeFormulas];
         $ranged = $range !== null && $range !== '';
-        $response = $this->engine->send('GET', $path, $query, accept: 'text/csv', headers: $ranged ? ['range' => $range] : []);
+        $response = $this->engine->send('GET', $path, $query, accept: 'text/csv', headers: $ranged ? ['range' => $range] : [], transfer: true);
         if ($ranged && $response->status !== 206) {
             $response->close();
-            throw new InvalidRequestException(
-                'This download cannot be fetched in parts: use filter "all" (or one status with escapeFormulas false) and columns "original" with a range.',
-                $response->status,
-                'invalid_request',
-                $response->header('x-request-id'),
-            );
+            throw self::rangeRefused($response);
         }
 
         return $response;
     }
 
-    /** @param string|list<string>|null $filter */
+    private static function rangeRefused(Response $response): InvalidRequestException
+    {
+        return new InvalidRequestException(
+            'This download cannot be fetched in parts: use filter "all" (or one status with escapeFormulas false) and columns "original" with a range.',
+            $response->status,
+            'invalid_request',
+            $response->header('x-request-id'),
+        );
+    }
+
+    /**
+     * Appends a body the transport did not already write to the file (the built-in transport writes 2xx bodies there
+     * directly and returns an empty one); returns the file's size.
+     *
+     * @param resource $out
+     */
+    private static function append(Response $response, $out): int
+    {
+        $in = $response->stream();
+        try {
+            if (stream_copy_to_stream($in, $out) === false) {
+                throw new \RuntimeException('The download file could not be written.');
+            }
+        } finally {
+            fclose($in);
+        }
+        fflush($out);
+        $stat = fstat($out);
+
+        return $stat === false ? 0 : $stat['size'];
+    }
+
+    /**
+     * `all`, one status, or a non-empty list of statuses joined with `,`. Anything else (an empty list, `all` inside
+     * a list, a retired name such as `spamtrap` or `risky`, an unknown value) is refused before any request.
+     *
+     * @param string|list<string>|null $filter
+     */
     private static function filter(string|array|null $filter): ?string
     {
         if ($filter === null) {
             return null;
         }
-        $parts = is_string($filter) ? [$filter] : $filter;
-        foreach ($parts as $part) {
-            if (!is_string($part) || ($part !== 'all' && !Vocabulary::isStatus($part))) {
-                throw new \InvalidArgumentException('filter must be "all", a status, or a list of statuses.');
+        $message = 'filter must be "all", a status, or a non-empty list of statuses.';
+        if (is_string($filter)) {
+            if ($filter !== 'all' && !Vocabulary::isStatus($filter)) {
+                throw new \InvalidArgumentException($message);
+            }
+
+            return $filter;
+        }
+        if ($filter === []) {
+            throw new \InvalidArgumentException($message);
+        }
+        foreach ($filter as $part) {
+            if (!is_string($part) || !Vocabulary::isStatus($part)) { // `all` is not a status: never inside a list
+                throw new \InvalidArgumentException($message);
             }
         }
 
-        return implode(',', $parts);
+        return implode(',', $filter);
     }
 
-    private static function fileBody(mixed $file): string
+    private static function fileBody(#[\SensitiveParameter] mixed $file): string
     {
         if (is_string($file)) {
             return $file;
+        }
+        if ($file instanceof \SplFileInfo) {
+            $path = $file->getPathname();
+            $contents = is_file($path) && is_readable($path) ? @file_get_contents($path) : false;
+            if ($contents === false) {
+                throw new \InvalidArgumentException('file could not be read.');
+            }
+
+            return $contents;
         }
         if (is_resource($file) && get_resource_type($file) === 'stream') {
             $contents = stream_get_contents($file);
@@ -237,7 +375,7 @@ final class BulkJobs
 
             return $contents;
         }
-        throw new \InvalidArgumentException('file must be a string or a readable stream.');
+        throw new \InvalidArgumentException('file must be a string, a readable stream or an \SplFileInfo.');
     }
 
     private static function monotonic(): float

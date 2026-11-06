@@ -53,7 +53,11 @@ final class Webhook
         }
 
         $expected = hash_hmac('sha256', $msgId . '.' . $timestamp . '.' . $payload, self::key($secret), true);
-        foreach (explode(' ', $signatures) as $entry) {
+        // entries are separated by spaces; a stack that joined repeated header lines with ", " leaves a trailing comma
+        foreach (preg_split('/ +/', $signatures, -1, PREG_SPLIT_NO_EMPTY) ?: [] as $entry) {
+            if (str_ends_with($entry, ',')) {
+                $entry = substr($entry, 0, -1);
+            }
             $comma = strpos($entry, ',');
             if ($comma === false || substr($entry, 0, $comma) !== 'v1') {
                 continue;
@@ -102,39 +106,48 @@ final class Webhook
         return $bytes === false ? null : $bytes;
     }
 
+    /** Any JSON object is the event, whatever its fields (forward compatible); anything else is "not JSON". */
     private static function event(string $payload): WebhookEvent
     {
         try {
+            $object = json_decode($payload, false, 512, JSON_THROW_ON_ERROR); // objects stay objects: `{}` is not `[]`
             $data = json_decode($payload, true, 512, JSON_THROW_ON_ERROR);
         } catch (\JsonException) {
             throw new WebhookVerificationException('The webhook body is not JSON.');
         }
-        if (!is_array($data)) {
-            throw new WebhookVerificationException('The webhook body is not a webhook event.');
+        if (!$object instanceof \stdClass || !is_array($data)) {
+            throw new WebhookVerificationException('The webhook body is not JSON.');
         }
-        try {
-            return WebhookEvent::fromArray($data);
-        } catch (\UnexpectedValueException) {
-            throw new WebhookVerificationException('The webhook body is not a webhook event.');
-        }
+
+        return WebhookEvent::fromArray($data);
     }
 
-    /** @param array<mixed> $headers */
+    /**
+     * The header's value: every value of the name in any case (several list items, names that differ only in case)
+     * joined with one space; the `$_SERVER` key (`HTTP_WEBHOOK_ID`) when the name itself is absent. A value of
+     * another type reads as absent.
+     *
+     * @param array<mixed> $headers
+     */
     private static function header(array $headers, string $name): ?string
     {
         $server = 'http_' . str_replace('-', '_', $name);
+        $values = [$name => [], $server => []];
         foreach ($headers as $key => $value) {
             $key = strtolower((string) $key);
             if ($key !== $name && $key !== $server) {
                 continue;
             }
             if (is_array($value)) {
-                return implode(' ', array_map(static fn (mixed $v): string => is_scalar($v) ? (string) $v : '', $value));
+                $values[$key][] = implode(' ', array_map(static fn (mixed $v): string => is_scalar($v) ? (string) $v : '', $value));
+            } elseif (is_scalar($value)) {
+                $values[$key][] = (string) $value;
+            } else {
+                return null;
             }
-
-            return is_scalar($value) ? (string) $value : null;
         }
+        $found = $values[$name] !== [] ? $values[$name] : $values[$server];
 
-        return null;
+        return $found === [] ? null : implode(' ', $found);
     }
 }

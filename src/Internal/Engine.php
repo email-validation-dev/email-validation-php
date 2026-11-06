@@ -72,29 +72,44 @@ final class Engine
         ($this->sleep)($seconds);
     }
 
+    /** A copy with another per-attempt timeout, sharing the key, base URL, retry settings, transport, sleep and clock. */
+    public function withTimeout(float $timeout): self
+    {
+        return new self($this->apiKey, $this->baseUrl, $timeout, $this->maxRetries, $this->maxRetryWait, $this->transport, $this->sleep, $this->clock);
+    }
+
     /**
      * Sends a request with the retry rules; returns the 2xx answer or throws a typed error.
      *
-     * @param array<string, string|int|bool|null> $query   unset (null) parameters are left out
-     * @param array<string, mixed>|null           $json    JSON body (compact; unset options already left out)
-     * @param array<string, string>               $headers extra headers
+     * @param array<string, string|int|bool|null> $query    unset (null) parameters are left out
+     * @param array<string, mixed>|null           $json     JSON body (compact; unset options already left out)
+     * @param array<string, string>               $headers  extra headers
+     * @param bool                                $transfer an upload or a results download: the timeout is an idle one
+     * @param resource|null                       $sink     where a transport may write the 2xx body (see {@see Request})
+     * @param list<int>                           $pass     non-2xx statuses returned as they are instead of thrown
      */
     public function send(
         string $method,
         string $path,
         array $query = [],
-        ?array $json = null,
-        ?string $body = null,
+        #[\SensitiveParameter] ?array $json = null,
+        #[\SensitiveParameter] ?string $body = null,
         ?string $contentType = null,
         string $accept = 'application/json',
         array $headers = [],
+        bool $transfer = false,
+        mixed $sink = null,
+        array $pass = [],
     ): Response {
-        $request = $this->buildRequest($method, $path, $query, $json, $body, $contentType, $accept, $headers);
+        $request = $this->buildRequest($method, $path, $query, $json, $body, $contentType, $accept, $headers, $transfer, $sink);
+        $sinkSize = $sink === null ? 0 : self::size($sink);
         for ($attempt = 0; ; ++$attempt) {
             try {
                 $response = $this->transport->send($request);
             } catch (TransportException $e) {
-                if ($method === 'GET' && $attempt < $this->maxRetries) {
+                // a download that already wrote bytes to its file is never retried (the next call resumes)
+                $wrote = $sink !== null && self::size($sink) !== $sinkSize;
+                if ($method === 'GET' && $attempt < $this->maxRetries && !$wrote) {
                     $this->sleep($this->backoff($attempt));
                     continue;
                 }
@@ -102,7 +117,7 @@ final class Engine
                     ? new ConnectionException('The request timed out.', 0, 'timeout', null, null, $e)
                     : new ConnectionException('The API could not be reached.', 0, 'connection_error', null, null, $e);
             }
-            if ($response->status >= 200 && $response->status < 300) {
+            if (($response->status >= 200 && $response->status < 300) || in_array($response->status, $pass, true)) {
                 return $response;
             }
             $error = $this->errorFrom($response);
@@ -206,16 +221,19 @@ final class Engine
      * @param array<string, string|int|bool|null> $query
      * @param array<string, mixed>|null           $json
      * @param array<string, string>               $extra
+     * @param resource|null                       $sink
      */
     private function buildRequest(
         string $method,
         string $path,
         array $query,
-        ?array $json,
-        ?string $body,
+        #[\SensitiveParameter] ?array $json,
+        #[\SensitiveParameter] ?string $body,
         ?string $contentType,
         string $accept,
         array $extra,
+        bool $transfer,
+        mixed $sink,
     ): Request {
         $params = [];
         foreach ($query as $name => $value) {
@@ -247,10 +265,20 @@ final class Engine
             $headers[strtolower($name)] = $value;
         }
 
-        return new Request($method, $url, $headers, $body, $this->timeout);
+        return new Request($method, $url, $headers, $body, $this->timeout, $transfer, $sink);
     }
 
-    private function errorFrom(Response $response): EmailValidationException
+    /** @param resource $stream */
+    private static function size($stream): int
+    {
+        fflush($stream);
+        $stat = fstat($stream);
+
+        return $stat === false ? 0 : $stat['size'];
+    }
+
+    /** The typed error for a non-2xx answer (its body is read and closed). */
+    public function errorFrom(Response $response): EmailValidationException
     {
         $status = $response->status;
         $requestId = $response->header('x-request-id');

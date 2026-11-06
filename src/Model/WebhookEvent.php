@@ -4,8 +4,6 @@ declare(strict_types=1);
 
 namespace EmailValidation\Model;
 
-use EmailValidation\Internal\Decode;
-
 /**
  * A verified webhook delivery. `type` is one of {@see \EmailValidation\WebhookEventType}; `data` is the event's
  * payload as an array with the API's field names:
@@ -15,6 +13,9 @@ use EmailValidation\Internal\Decode;
  * - `credits.low`: `balance`, `threshold`
  * - `credits.expiring`: `credits`, `expires_at`
  * - `webhook.test`: `endpoint_id` (sent only by "Send test" in the dashboard)
+ *
+ * Any signed JSON object is an event, whatever its fields (forward compatible): a field that is missing or of another
+ * type reads as `''` (`type`, `timestamp`) or `[]` (`data`). Both stay `string`, as in 1.0.0.
  */
 final class WebhookEvent implements \JsonSerializable
 {
@@ -30,10 +31,13 @@ final class WebhookEvent implements \JsonSerializable
     /** @param array<mixed> $data */
     public static function fromArray(array $data): self
     {
-        /** @var array<string, mixed> $payload */
-        $payload = Decode::object($data, 'data');
+        $type = $data['type'] ?? null;
+        $timestamp = $data['timestamp'] ?? null;
+        $payload = $data['data'] ?? null;
+        /** @var array<string, mixed> $fields */
+        $fields = is_array($payload) ? $payload : [];
 
-        return new self(Decode::string($data, 'type'), Decode::string($data, 'timestamp'), $payload);
+        return new self(is_string($type) ? $type : '', is_string($timestamp) ? $timestamp : '', $fields);
     }
 
     /** @return array{type: string, timestamp: string, data: array<string, mixed>} */

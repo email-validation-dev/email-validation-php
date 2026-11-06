@@ -30,9 +30,9 @@ use EmailValidation\Model\ValidationResult;
  */
 final class Client
 {
-    public const SDK_VERSION = '1.0.0';
+    public const SDK_VERSION = '1.1.0';
 
-    /** Bulk jobs: `create`, `get`, `start`, `cancel`, `results`, `resultsStream`, `wait`. */
+    /** Bulk jobs: `create`, `get`, `start`, `cancel`, `results`, `resultsStream`, `download`, `wait`. */
     public readonly BulkJobs $bulk;
 
     private readonly Engine $engine;
@@ -40,8 +40,10 @@ final class Client
     /**
      * @param string                     $apiKey       your API key (`ev_live_…`); keep it on the server
      * @param string|null                $baseUrl      default `https://api.email-validation.org`
-     * @param float                      $timeout      seconds per attempt, connect and full answer (default 30; a check
-     *                                                 may take up to 15 s on our side)
+     * @param float                      $timeout      seconds per attempt (default 30; a check may take up to 15 s on our
+     *                                                 side): for JSON calls a bound on the whole attempt (connect and
+     *                                                 full answer); for file uploads and results downloads an idle
+     *                                                 timeout (no byte sent or received for that long), never a total cap
      * @param int                        $maxRetries   retries after the first attempt (default 2; negative = 0)
      * @param float                      $maxRetryWait longest single wait before a retry the client accepts, in seconds
      *                                                 (default 10; negative = 0)
@@ -69,9 +71,7 @@ final class Client
         if (preg_match('#^https?://#', $url) !== 1) {
             throw new \InvalidArgumentException('baseUrl must be an http:// or https:// URL.');
         }
-        if (!is_finite($timeout) || $timeout <= 0) {
-            throw new \InvalidArgumentException('timeout must be a positive number of seconds.');
-        }
+        self::checkTimeout($timeout);
         $this->engine = new Engine(
             new Secret($apiKey),
             $url,
@@ -87,6 +87,36 @@ final class Client
             $clock ?? static fn (): float => microtime(true),
         );
         $this->bulk = new BulkJobs($this->engine);
+    }
+
+    /**
+     * A client with another per-attempt `timeout`, for the calls made through it (every poll of `bulk->wait()`
+     * included): `$client->withTimeout(120.0)->bulk->results($id)`. It shares this client's key, base URL, retry
+     * settings, transport, sleep and clock and is cheap to make; this client keeps its own timeout.
+     *
+     * @throws \InvalidArgumentException when the timeout is not a positive, finite number of seconds
+     */
+    public function withTimeout(float $timeout): self
+    {
+        self::checkTimeout($timeout);
+        $copy = (new \ReflectionClass(self::class))->newInstanceWithoutConstructor();
+        $copy->adopt($this->engine->withTimeout($timeout));
+
+        return $copy;
+    }
+
+    private function adopt(Engine $engine): void
+    {
+        // a copy made without the constructor, so its readonly properties are still unset: PHP allows this once
+        $this->engine = $engine; // @phpstan-ignore property.readOnlyAssignNotInConstructor
+        $this->bulk = new BulkJobs($engine); // @phpstan-ignore property.readOnlyAssignNotInConstructor
+    }
+
+    private static function checkTimeout(float $timeout): void
+    {
+        if (!is_finite($timeout) || $timeout <= 0) {
+            throw new \InvalidArgumentException('timeout must be a positive number of seconds.');
+        }
     }
 
     /**

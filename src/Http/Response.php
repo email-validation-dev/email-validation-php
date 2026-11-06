@@ -20,7 +20,7 @@ final class Response
      * @param array<string, string|list<string>> $headers header names in any case; several values are joined with ", "
      * @param string|resource                    $body
      */
-    public function __construct(public readonly int $status, array $headers = [], mixed $body = '')
+    public function __construct(public readonly int $status, array $headers = [], #[\SensitiveParameter] mixed $body = '')
     {
         if (!is_string($body) && !is_resource($body)) {
             throw new \InvalidArgumentException('Response body must be a string or a stream resource.');
